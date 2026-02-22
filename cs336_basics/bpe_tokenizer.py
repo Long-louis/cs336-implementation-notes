@@ -1,3 +1,4 @@
+import json
 import os
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
@@ -302,4 +303,153 @@ class BpeTokenizer:
     """
     BPE 分词器，用于对文本进行编码和解码。
     """
-    ...
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ) -> None:
+        """
+        由给定词表、merge 列表和（可选）特殊 token 构造 tokenizer。
+
+        Args:
+            vocab: 词表映射，键为 token id，值为 token 对应的 bytes。
+            merges: BPE 训练得到的 merge 序列，按创建顺序排列。
+            special_tokens: 可选特殊 token 列表。
+        """
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens if special_tokens is not None else []
+        self.special_tokens_bytes = [token.encode('utf-8') for token in self.special_tokens]
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str | os.PathLike,
+        merges_filepath: str | os.PathLike,
+        special_tokens: list[str] | None = None,
+    ) -> "BpeTokenizer":
+        """
+        从序列化的 vocab 与 merges 文件构造 tokenizer。
+
+        Args:
+            vocab_filepath: 词表文件路径。
+            merges_filepath: merges 文件路径。
+            special_tokens: 可选特殊 token 列表。
+
+        Returns:
+            BpeTokenizer: 构造得到的 tokenizer。
+        """
+        vocab = {}
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            vocab_json = json.load(f)
+            for token_id_str, token_bytes_latin1 in vocab_json.items():
+                token_id = int(token_id_str)
+                token_bytes = token_bytes_latin1.encode("latin-1")
+                vocab[token_id] = token_bytes
+
+        merges = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                left_str, right_str = json.loads(line.strip())
+                left_bytes = left_str.encode("latin-1")
+                right_bytes = right_str.encode("latin-1")
+                merges.append((left_bytes, right_bytes))
+
+        return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
+        
+
+    def encode(self, text: str) -> list[int]:
+        """
+        将输入文本编码为 token id 序列。
+
+        Args:
+            text: 输入字符串。
+
+        Returns:
+            list[int]: 编码后的 token id 序列。
+        """
+        if text == "":
+            return []
+
+        bytes_to_id = {token_bytes: token_id for token_id, token_bytes in self.vocab.items()}
+
+        # 与训练阶段保持一致的 GPT-2 预分词正则
+        pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+        # 先按 special token 切分，special token 不参与普通 BPE merge
+        if self.special_tokens:
+            escaped = [re.escape(token) for token in sorted(self.special_tokens, key=len, reverse=True)]
+            # 注意：这里的切分模式会保留分隔符（特殊 token）作为独立的 segment，方便后续处理
+            special_pattern = f"({'|'.join(escaped)})"
+            segments = re.split(special_pattern, text)
+        else:
+            segments = [text]
+
+        encoded_ids: list[int] = []
+
+        for segment in segments:
+            if not segment:
+                continue
+
+            if segment in self.special_tokens:
+                special_bytes = segment.encode("utf-8")
+                encoded_ids.append(bytes_to_id[special_bytes])
+                continue
+
+            # 在每个 pre-token 内独立进行 merge，不跨边界
+            for pre_token in re.findall(pattern, segment):
+                # 为什么bytes([b])的b要用[]包裹？因为我们需要将每个单字节转换为一个长度为1的bytes对象，而bytes([b])正好可以实现这个功能。直接使用bytes(b)会将整数b解释为一个长度为b的全零字节序列，这不是我们想要的。
+                token_sequence = [bytes([b]) for b in pre_token.encode("utf-8")]
+
+                # 按训练时 merge 创建顺序依次应用
+                for left, right in self.merges:
+                    if len(token_sequence) < 2:
+                        break
+
+                    merged_sequence: list[bytes] = []
+                    i = 0
+                    while i < len(token_sequence):
+                        if i < len(token_sequence) - 1 and token_sequence[i] == left and token_sequence[i + 1] == right:
+                            merged_sequence.append(left + right)
+                            i += 2
+                        else:
+                            merged_sequence.append(token_sequence[i])
+                            i += 1
+                    token_sequence = merged_sequence
+
+                for token_bytes in token_sequence:
+                    encoded_ids.append(bytes_to_id[token_bytes])
+
+        return encoded_ids
+
+
+
+
+    def encode_iterable(self, iterable: Iterator[str]) -> Iterator[int]:
+        """
+        对字符串可迭代对象进行惰性编码，逐个产出 token id。
+
+        Args:
+            iterable: 字符串可迭代对象（如文件句柄逐行迭代）。
+
+        Yields:
+            int: 编码后的 token id。
+        """
+        for text in iterable:
+            for token_id in self.encode(text):
+                yield token_id
+
+    def decode(self, ids: list[int]) -> str:
+        """
+        将 token id 序列解码为字符串。
+
+        Args:
+            ids: token id 序列。
+
+        Returns:
+            str: 解码后的文本。
+        """
+        bytes_sequence = b"".join(self.vocab[token_id] for token_id in ids)
+        return bytes_sequence.decode("utf-8", errors="replace")
+
