@@ -590,5 +590,5 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     from cs336_basics.bpe_tokenizer import BpeTokenizerTrainer
-    trainer = BpeTokenizerTrainer(input_path, vocab_size, special_tokens, **kwargs)
-    return trainer.train()
+    trainer = BpeTokenizerTrainer(vocab_size=vocab_size, special_tokens=special_tokens, **kwargs)
+    return trainer.train(input_path=input_path)
