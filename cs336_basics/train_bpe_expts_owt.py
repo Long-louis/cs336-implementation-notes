@@ -4,7 +4,7 @@ import resource
 import time
 from pathlib import Path
 
-from cs336_basics.bpe_tokenizer import BpeTokenizerTrainer
+from cs336_basics.tokenizer import BpeTokenizerTrainer
 
 
 def _max_rss_gb() -> float:
