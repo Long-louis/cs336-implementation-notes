@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-def sample_next_token(model: nn.Module, input_tokens: torch.LongTensor, temperature: float = 1.0, top_k: int = 0) -> torch.LongTensor:
+def sample_next_token(model: nn.Module, input_tokens: torch.Tensor, temperature: float = 1.0, top_k: int = 0) -> torch.Tensor:
     """给定输入 token 序列，使用模型预测下一个 token 的 ID。
 
     Args:
@@ -26,7 +26,15 @@ def sample_next_token(model: nn.Module, input_tokens: torch.LongTensor, temperat
     return next_token_id
 
 
-def generate(model: nn.Module, input_tokens: torch.LongTensor, max_length: int, context_length: int, temperature: float = 1.0, top_k: int = 0, device=None) -> torch.LongTensor:
+def generate(
+    model: nn.Module,
+    input_tokens: torch.Tensor,
+    max_length: int,
+    context_length: int,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
     """从输入 token 序列开始，生成新的 token 序列。
 
     Args:
