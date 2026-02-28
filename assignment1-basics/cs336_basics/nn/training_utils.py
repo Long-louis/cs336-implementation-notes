@@ -48,7 +48,7 @@ def gradient_clipping(params: Iterable[torch.nn.Parameter], max_norm: float) -> 
         for grad in grads:
             grad.detach().mul_(clip_coef)
 
-def get_batch(data: numpy.ndarray, batch_size: int, context_length: int, device: torch.device) -> torch.Tensor:
+def get_batch(data: numpy.ndarray, batch_size: int, context_length: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor] :
     """从数据中随机采样一个批次。
 
     Args:
