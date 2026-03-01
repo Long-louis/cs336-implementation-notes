@@ -1,4 +1,5 @@
 import argparse
+import math
 import time
 from pathlib import Path
 
@@ -168,6 +169,12 @@ def run_training(args: argparse.Namespace) -> None:
 			group=args.wandb_group,
 			config=vars(args),
 		)
+		wandb.define_metric("train/grad_step")
+		wandb.define_metric("time/wallclock_seconds")
+		wandb.define_metric("train/loss", step_metric="train/grad_step")
+		wandb.define_metric("valid/loss", step_metric="train/grad_step")
+		wandb.define_metric("train/perplexity", step_metric="train/grad_step")
+		wandb.define_metric("valid/perplexity", step_metric="train/grad_step")
 
 	args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -177,6 +184,7 @@ def run_training(args: argparse.Namespace) -> None:
 
 	model.train()
 	tokens_per_step = args.batch_size * args.context_length
+	run_start_time = time.perf_counter()
 
 	for it in range(start_iter, args.max_iters):
 		step_start_time = time.perf_counter()
@@ -207,9 +215,12 @@ def run_training(args: argparse.Namespace) -> None:
 		optimizer.step()
 
 		step_time = time.perf_counter() - step_start_time
+		elapsed_seconds = time.perf_counter() - run_start_time
 		train_loss_value = float(loss.detach().cpu())
+		train_perplexity = math.exp(train_loss_value)
 		tokens_per_second = tokens_per_step / step_time
 		current_iter = it + 1
+		tokens_seen = current_iter * tokens_per_step
 
 		should_eval = current_iter % args.eval_interval == 0
 		should_log = current_iter % args.log_interval == 0 or should_eval
@@ -228,13 +239,18 @@ def run_training(args: argparse.Namespace) -> None:
 
 		if should_log:
 			metrics: dict[str, float | int] = {
-				"iter": current_iter,
+				"train/grad_step": current_iter,
 				"train/loss": train_loss_value,
+				"train/perplexity": train_perplexity,
 				"train/lr": lr,
+				"train/step_time_seconds": step_time,
+				"train/tokens_seen": tokens_seen,
 				"train/tokens_per_second": tokens_per_second,
+				"time/wallclock_seconds": elapsed_seconds,
 			}
 			if val_loss_value is not None:
 				metrics["valid/loss"] = val_loss_value
+				metrics["valid/perplexity"] = math.exp(val_loss_value)
 
 			print(metrics)
 
