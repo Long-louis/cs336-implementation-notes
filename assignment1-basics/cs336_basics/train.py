@@ -124,7 +124,63 @@ def evaluate_loss(
 	return sum(losses) / len(losses)
 
 
+def apply_wandb_sweep_overrides(args: argparse.Namespace) -> argparse.Namespace:
+	if not args.use_wandb:
+		return args
+
+	if wandb.run is None:
+		return args
+
+	config = wandb.config
+	config_keys = set(config.keys())
+	path_fields = {"train_tokens_path", "valid_tokens_path", "checkpoint_dir", "resume_from"}
+
+	for key, value in vars(args).items():
+		if key not in config_keys:
+			continue
+
+		config_value = config[key]
+		if key in path_fields:
+			if config_value is None:
+				setattr(args, key, None)
+			else:
+				setattr(args, key, Path(config_value))
+			continue
+
+		setattr(args, key, config_value)
+
+	return args
+
+
 def run_training(args: argparse.Namespace) -> None:
+	if args.use_wandb:
+		wandb.init(
+			project=args.wandb_project,
+			entity=args.wandb_entity,
+			name=args.wandb_run_name,
+			group=args.wandb_group,
+			config=vars(args),
+		)
+		args = apply_wandb_sweep_overrides(args)
+		# 指标说明：
+		# - train/grad_step: 优化器实际完成的梯度更新步数，也是大多数曲线的横轴。
+		# - time/wallclock_seconds: 从训练开始到当前记录点的累计真实耗时（秒）。
+		wandb.define_metric("train/grad_step")
+		wandb.define_metric("time/wallclock_seconds")
+		# - train/loss: 当前训练 batch 的 token 平均交叉熵损失，越低越好，但噪声较大。
+		# - valid/loss: 验证集上按若干 batch 平均后的 token 平均交叉熵损失，是更关键的泛化指标。
+		# - train/perplexity: 训练损失对应的困惑度，等于 exp(train/loss)，越低越好。
+		# - valid/perplexity: 验证损失对应的困惑度，等于 exp(valid/loss)，越低越好。
+		wandb.define_metric("train/loss", step_metric="train/grad_step")
+		wandb.define_metric("valid/loss", step_metric="train/grad_step")
+		wandb.define_metric("train/perplexity", step_metric="train/grad_step")
+		wandb.define_metric("valid/perplexity", step_metric="train/grad_step")
+		run = wandb.run
+		if run is None:
+			raise ValueError("W&B run 初始化失败")
+		args.wandb_run_name = run.name
+		args.checkpoint_dir = args.checkpoint_dir / run.id
+
 	device = resolve_device(args.device)
 	dtype = resolve_dtype(args.dtype)
 
@@ -160,21 +216,6 @@ def run_training(args: argparse.Namespace) -> None:
 		eps=args.eps,
 		weight_decay=args.weight_decay,
 	)
-
-	if args.use_wandb:
-		wandb.init(
-			project=args.wandb_project,
-			entity=args.wandb_entity,
-			name=args.wandb_run_name,
-			group=args.wandb_group,
-			config=vars(args),
-		)
-		wandb.define_metric("train/grad_step")
-		wandb.define_metric("time/wallclock_seconds")
-		wandb.define_metric("train/loss", step_metric="train/grad_step")
-		wandb.define_metric("valid/loss", step_metric="train/grad_step")
-		wandb.define_metric("train/perplexity", step_metric="train/grad_step")
-		wandb.define_metric("valid/perplexity", step_metric="train/grad_step")
 
 	args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -238,6 +279,12 @@ def run_training(args: argparse.Namespace) -> None:
 			)
 
 		if should_log:
+			# 记录到控制台和 W&B 的指标说明：
+			# - train/lr: 当前 step 实际使用的学习率，可用来对照 warmup 和 cosine 衰减是否符合预期。
+			# - train/step_time_seconds: 单个训练 step 的耗时，可用于观察吞吐是否稳定。
+			# - train/tokens_seen: 从训练开始累计处理过的 token 数，便于跨 batch size 对齐训练进度。
+			# - train/tokens_per_second: 当前 step 的吞吐率，越高说明 GPU/数据管线利用越充分。
+			# - time/wallclock_seconds: 当前 run 从开始到现在的累计真实时间。
 			metrics: dict[str, float | int] = {
 				"train/grad_step": current_iter,
 				"train/loss": train_loss_value,
