@@ -62,6 +62,13 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--wandb-entity", type=str, default=None)
 	parser.add_argument("--wandb-run-name", type=str, default=None)
 	parser.add_argument("--wandb-group", type=str, default=None)
+	parser.add_argument("--wandb-append-key-params", action="store_true")
+	parser.add_argument("--auto-stop-on-divergence", action="store_true")
+	parser.add_argument("--divergence-train-loss-threshold", type=float, default=20.0)
+	parser.add_argument("--divergence-val-loss-threshold", type=float, default=20.0)
+	parser.add_argument("--divergence-val-loss-increase-ratio", type=float, default=1.08)
+	parser.add_argument("--divergence-patience-evals", type=int, default=2)
+	parser.add_argument("--divergence-min-evals-before-stop", type=int, default=3)
 
 	return parser.parse_args()
 
@@ -178,6 +185,8 @@ def run_training(args: argparse.Namespace) -> None:
 		run = wandb.run
 		if run is None:
 			raise ValueError("W&B run 初始化失败")
+		if args.wandb_append_key_params:
+			run.name = f"{run.name}-bs{args.batch_size}-lr{args.max_learning_rate:g}"
 		args.wandb_run_name = run.name
 		args.checkpoint_dir = args.checkpoint_dir / run.id
 
@@ -226,6 +235,11 @@ def run_training(args: argparse.Namespace) -> None:
 	model.train()
 	tokens_per_step = args.batch_size * args.context_length
 	run_start_time = time.perf_counter()
+	best_val_loss = float("inf")
+	bad_eval_streak = 0
+	eval_count = 0
+	stop_now = False
+	stop_reason = ""
 
 	for it in range(start_iter, args.max_iters):
 		step_start_time = time.perf_counter()
@@ -258,7 +272,13 @@ def run_training(args: argparse.Namespace) -> None:
 		step_time = time.perf_counter() - step_start_time
 		elapsed_seconds = time.perf_counter() - run_start_time
 		train_loss_value = float(loss.detach().cpu())
-		train_perplexity = math.exp(train_loss_value)
+		if not math.isfinite(train_loss_value):
+			stop_now = True
+			stop_reason = f"train/loss 为 {train_loss_value}，参数已不可恢复，提前终止"
+		try:
+			train_perplexity = math.exp(train_loss_value)
+		except OverflowError:
+			train_perplexity = float('inf')
 		tokens_per_second = tokens_per_step / step_time
 		current_iter = it + 1
 		tokens_seen = current_iter * tokens_per_step
@@ -277,6 +297,35 @@ def run_training(args: argparse.Namespace) -> None:
 				eval_batches=args.eval_batches,
 				device=device,
 			)
+			eval_count += 1
+
+			if args.auto_stop_on_divergence:
+				if not math.isfinite(val_loss_value):
+					stop_now = True
+					stop_reason = "valid/loss 非有限值（NaN 或 Inf）"
+				elif val_loss_value >= args.divergence_val_loss_threshold:
+					stop_now = True
+					stop_reason = (
+						f"valid/loss={val_loss_value:.6f} 超过阈值 "
+						f"{args.divergence_val_loss_threshold:.6f}"
+					)
+				else:
+					if val_loss_value < best_val_loss:
+						best_val_loss = val_loss_value
+						bad_eval_streak = 0
+					else:
+						if eval_count >= args.divergence_min_evals_before_stop and best_val_loss < float("inf"):
+							if val_loss_value >= best_val_loss * args.divergence_val_loss_increase_ratio:
+								bad_eval_streak += 1
+							else:
+								bad_eval_streak = 0
+					if bad_eval_streak >= args.divergence_patience_evals:
+						stop_now = True
+						stop_reason = (
+							f"valid/loss 连续 {bad_eval_streak} 次明显劣化，"
+							f"当前={val_loss_value:.6f}, best={best_val_loss:.6f}, "
+							f"ratio阈值={args.divergence_val_loss_increase_ratio:.3f}"
+						)
 
 		if should_log:
 			# 记录到控制台和 W&B 的指标说明：
@@ -297,7 +346,10 @@ def run_training(args: argparse.Namespace) -> None:
 			}
 			if val_loss_value is not None:
 				metrics["valid/loss"] = val_loss_value
-				metrics["valid/perplexity"] = math.exp(val_loss_value)
+				try:
+					metrics["valid/perplexity"] = math.exp(val_loss_value)
+				except OverflowError:
+					metrics["valid/perplexity"] = float('inf')
 
 			print(metrics)
 
@@ -309,6 +361,12 @@ def run_training(args: argparse.Namespace) -> None:
 			latest_path = args.checkpoint_dir / "latest.pt"
 			save_checkpoint(model=model, optimizer=optimizer, iteration=current_iter, out=ckpt_path)
 			save_checkpoint(model=model, optimizer=optimizer, iteration=current_iter, out=latest_path)
+
+		if stop_now:
+			print({"train/grad_step": current_iter, "stop/reason": stop_reason})
+			if args.use_wandb:
+				wandb.log({"train/grad_step": current_iter, "stop/reason": stop_reason}, step=current_iter)
+			break
 
 	final_path = args.checkpoint_dir / "final.pt"
 	save_checkpoint(model=model, optimizer=optimizer, iteration=args.max_iters, out=final_path)
