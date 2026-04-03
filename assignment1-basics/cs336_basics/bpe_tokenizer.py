@@ -9,6 +9,11 @@ import regex as re
 import tqdm  # 建议安装 tqdm 用于显示进度条: pip install tqdm
 
 
+GPT2_PRETOKEN_PATTERN = re.compile(
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
+
+
 class BpeTokenizerTrainer:
     """
     BPE 分词器训练器，用于从语料库中提取字节对编码并训练词表。
@@ -321,6 +326,16 @@ class BpeTokenizer:
         self.merges = merges
         self.special_tokens = special_tokens if special_tokens is not None else []
         self.special_tokens_bytes = [token.encode('utf-8') for token in self.special_tokens]
+        self.bytes_to_id = {token_bytes: token_id for token_id, token_bytes in self.vocab.items()}
+        self.merge_ranks = {pair: rank for rank, pair in enumerate(self.merges)}
+        self._bpe_cache: dict[bytes, list[int]] = {}
+        self._max_cache_size = 200_000
+
+        if self.special_tokens:
+            escaped = [re.escape(token) for token in sorted(self.special_tokens, key=len, reverse=True)]
+            self.special_token_pattern = re.compile(f"({'|'.join(escaped)})")
+        else:
+            self.special_token_pattern = None
 
     @classmethod
     def from_files(
@@ -359,6 +374,46 @@ class BpeTokenizer:
         return cls(vocab=vocab, merges=merges, special_tokens=special_tokens)
         
 
+    def _merge_pretoken_bytes(self, pretoken_bytes: bytes) -> list[int]:
+        cached = self._bpe_cache.get(pretoken_bytes)
+        if cached is not None:
+            return cached
+
+        token_sequence: tuple[bytes, ...] = tuple(bytes([byte_value]) for byte_value in pretoken_bytes)
+
+        while len(token_sequence) >= 2:
+            best_pair: tuple[bytes, bytes] | None = None
+            best_rank: int | None = None
+
+            for pair in zip(token_sequence, token_sequence[1:]):
+                rank = self.merge_ranks.get(pair)
+                if rank is None:
+                    continue
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    best_pair = pair
+
+            if best_pair is None:
+                break
+
+            merged_token = best_pair[0] + best_pair[1]
+            merged_sequence: list[bytes] = []
+            index = 0
+            while index < len(token_sequence):
+                if index < len(token_sequence) - 1 and (token_sequence[index], token_sequence[index + 1]) == best_pair:
+                    merged_sequence.append(merged_token)
+                    index += 2
+                    continue
+                merged_sequence.append(token_sequence[index])
+                index += 1
+            token_sequence = tuple(merged_sequence)
+
+        token_ids = [self.bytes_to_id[token_bytes] for token_bytes in token_sequence]
+        if len(self._bpe_cache) >= self._max_cache_size:
+            self._bpe_cache.clear()
+        self._bpe_cache[pretoken_bytes] = token_ids
+        return token_ids
+
     def encode(self, text: str) -> list[int]:
         """
         将输入文本编码为 token id 序列。
@@ -372,17 +427,9 @@ class BpeTokenizer:
         if text == "":
             return []
 
-        bytes_to_id = {token_bytes: token_id for token_id, token_bytes in self.vocab.items()}
-
-        # 与训练阶段保持一致的 GPT-2 预分词正则
-        pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
         # 先按 special token 切分，special token 不参与普通 BPE merge
-        if self.special_tokens:
-            escaped = [re.escape(token) for token in sorted(self.special_tokens, key=len, reverse=True)]
-            # 注意：这里的切分模式会保留分隔符（特殊 token）作为独立的 segment，方便后续处理
-            special_pattern = f"({'|'.join(escaped)})"
-            segments = re.split(special_pattern, text)
+        if self.special_token_pattern is not None:
+            segments = self.special_token_pattern.split(text)
         else:
             segments = [text]
 
@@ -394,32 +441,12 @@ class BpeTokenizer:
 
             if segment in self.special_tokens:
                 special_bytes = segment.encode("utf-8")
-                encoded_ids.append(bytes_to_id[special_bytes])
+                encoded_ids.append(self.bytes_to_id[special_bytes])
                 continue
 
             # 在每个 pre-token 内独立进行 merge，不跨边界
-            for pre_token in re.findall(pattern, segment):
-                # 为什么bytes([b])的b要用[]包裹？因为我们需要将每个单字节转换为一个长度为1的bytes对象，而bytes([b])正好可以实现这个功能。直接使用bytes(b)会将整数b解释为一个长度为b的全零字节序列，这不是我们想要的。
-                token_sequence = [bytes([b]) for b in pre_token.encode("utf-8")]
-
-                # 按训练时 merge 创建顺序依次应用
-                for left, right in self.merges:
-                    if len(token_sequence) < 2:
-                        break
-
-                    merged_sequence: list[bytes] = []
-                    i = 0
-                    while i < len(token_sequence):
-                        if i < len(token_sequence) - 1 and token_sequence[i] == left and token_sequence[i + 1] == right:
-                            merged_sequence.append(left + right)
-                            i += 2
-                        else:
-                            merged_sequence.append(token_sequence[i])
-                            i += 1
-                    token_sequence = merged_sequence
-
-                for token_bytes in token_sequence:
-                    encoded_ids.append(bytes_to_id[token_bytes])
+            for pre_token in GPT2_PRETOKEN_PATTERN.findall(segment):
+                encoded_ids.extend(self._merge_pretoken_bytes(pre_token.encode("utf-8")))
 
         return encoded_ids
 
