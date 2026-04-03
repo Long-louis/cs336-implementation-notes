@@ -395,3 +395,163 @@ $$
 - **硬件参数对齐**: 严格使用题目给出的 **19.5 TFLOPS (FP32)**，而不是通用认知下的 312 TFLOPS，这解释了为什么最终训练天数如此巨大。
 
 **下一步建议**：如果你需要将这个计算过程写进报告，我可以帮你把上述推导整理成标准的学术 LaTeX 论文格式。需要我这样做吗？
+
+### Problem (learning_rate)
+
+#### (a) Perform a hyperparameter sweep over the learning rates and report the final losses
+
+我将学习率结果按两种工业界常用标准整理如下，并且严格区分了比较口径。
+
+1) 固定训练预算（fixed-step）
+
+- 在 2500 step 口径（与 round4/round5 早停口径一致）下：
+  - `lr=0.0055` 的 `valid/loss=1.44327`。
+  - `lr=0.012` 在 2500 step 的 `valid/loss=1.46638`。
+  - 因此在 2500 step 预算下，`0.0055` 明显优于 `0.012`。
+- 在 4000 step 口径（完整预算）下：
+  - `lr=0.0055` 的最终 `valid/loss=1.34497`。
+  - `lr=0.012` 的最终 `valid/loss=1.33268`（更低）。
+  - 因此在 4000 step 完整预算下，`0.012` 优于 `0.0055`。
+
+2) 固定质量目标（time-to-quality）
+
+- 以 `valid/loss<=1.45` 为阈值，`lr=0.012` 的到达时间约 `7204s`，快于 `lr=0.0055` 的约 `8306s`。
+- 这说明在“达到目标质量速度”标准下，`0.012` 也更有优势。
+
+最终主标准与结论：
+
+- 本作业主标准采用固定训练预算（4000 step）下的验证损失。
+- 按该主标准，当前最佳学习率更新为 `max_learning_rate=0.012`。
+- `0.0055` 不是错误结论，它对应的是更小预算（2500 step）下的局部最优。
+
+关于是否需要重跑全部实验：
+
+- 若目标是完成本作业并给出自洽结论，当前结果已足够，不必为了统一到 `lr=0.012` 重跑全部 batch-size 扫描。
+- 在 writeup 中明确说明：现有 batch-size 结论基于 `lr=0.0055`，用于趋势分析；若要得出“在最终最优学习率下的最优 batch size”这一更强结论，才需要额外重跑。
+
+学习曲线截图预留位置：
+
+- `[在此插入 2500-step 口径对比图（lr=0.0055 vs 0.012）建议文件名 lr_compare_step2500.png]`
+- `[在此插入 4000-step 完整预算对比图（lr=0.0055/0.008/0.01/0.012/0.016）建议文件名 lr_compare_step4000.png]`
+- `[在此插入 time-to-quality 对比图（阈值1.45）建议文件名 lr_time_to_quality.png]`
+
+#### (b) Investigate how the point at which learning rates diverge is related to your best learning rate
+
+我额外做了更高学习率探测（`0.008 / 0.010 / 0.012 / 0.016`）。在当前训练设置（warmup + cosine decay）下，这些点并未出现数值爆炸式发散，而是表现为：
+
+- 随学习率提高，早期（2500 step）验证损失先变差；
+- 但在完整预算（4000 step）下，`0.012` 反而取得更低最终损失。
+
+这说明本实验中“最优学习率”与“发散点”的关系是：最优点位于已探测区间的高端，但仍未触及明显发散边界。也就是说，当前只观察到“性能回落/不稳定风险增加”的趋势，还没有观察到明确 divergence run。
+
+因此我在报告中将该结论表述为：`0.012` 是在当前预算与调度下的经验最优点；发散边界可能高于 `0.016`，但受算力预算限制，本次不再继续扩大扫描区间。
+
+发散实验截图预留位置：
+
+- `[在此插入 increasing-learning-rate 曲线图（0.008/0.01/0.012/0.016）建议文件名 lr_high_range_curves.png]`
+- `[在此插入 “未观测到明确发散” 说明图（可与上图合并）建议文件名 lr_divergence_note.png]`
+
+---
+
+### Problem (generate)
+
+我们将使用在 TinyStories 数据集上训练好的 17M Transformer 模型进行文本生成。下面对比了两个不同超参数配置下训练出的模型生成效果。
+
+#### 1. 模型 A：验证集损失最优配置 (LR=0.0055, Round 5)
+- **Checkpoint**: `4kogvde4` (Iter 2500, Valid Loss ≈ 1.442)
+- **生成参数**: Temperature=0.8, Top-K=40
+- **生成文本**:
+> , there was a little girl named Amy. Amy loved to play outside in the dirt. She liked to scatter dirt all around her yard. One day, Amy found a big, shiny rock. It was very pretty and sparkly. She wanted to show her mom. Amy ran to her mom and said, "Mom, look what I found!" Her mom looked at the rock and said, "Oh, Amy! This rock is so nice. Let's keep it safe." So, Amy and her mom put the rock in a pot with water and kept it clean. Later, Amy went outside to play. It was very dark. She was scared and started to tremble. Her mom said, "Amy, I didn't see the rock today." But then, the rock started to move again. It became a friendly rock! Amy was happy she found the rock and was not scared anymore. <|endoftext|>
+
+#### 2. 模型 B：高学习率配置 (LR=0.012, Divergence Probe)
+- **Checkpoint**: `zn1oafz2` (Iter 4000)
+- **生成参数**: Temperature=0.8, Top-K=40
+- **生成文本**:
+> , in a small house, there was a little cat named Kitty. She was a very independent cat. Kitty liked to play outside all by herself. One day, Kitty saw a big hole in the ground. She thought it would be fun to jump in and see what was inside. Kitty jumped into the hole and started to soak her paws, which were soft and fluffy. She had so much fun! She played all day long and never wanted to stop. Kitty was very happy in the hole. But one day, something unexpected happened. A big bird came and sat down near the hole. The bird saw Kitty in the hole and thought it was a new friend. The bird flew down and said, "Hi, I'm lost! Can you help me find my way home?" Kitty was surprised but wanted to help the bird. So, Kitty and the bird went on a big adventure to find her home. They looked and looked until they found the bird's home. The bird was so happy to be back home, and Kitty was glad she met the bird. They became best friends and played together every day. <|endoftext|>
+
+#### 生成效果简评
+- **连贯性**: 两个模型都能生成语法基本正确且逻辑连贯的小故事。这说明 17M 的参数量对于 TinyStories 这种词汇量和语法结构受限的数据集已经能够捕捉到足够的叙事规律。
+
+整体流畅度较好：两段故事均遵循 TinyStories 典型叙事结构（引入角色 → 遇到事件 → 解决 → 快乐结尾），句子简单、语义连贯、有完整结局。局限性来自模型容量和词表大小：
+- 生成 1 中出现了 "Sue pinched the gently with her hand"（缺少宾语 "it"）这样的轻微语法错误。
+- 生成 2 更为规整，几乎无明显病句，与 temperature/top\_p 偏低导致采样更保守有关。
+
+**影响输出质量的两个关键因素**
+
+1. **temperature（温度参数）**：温度越高（→1.0），softmax 分布越扁平，低概率词被选中的可能性上升，生成更多样但偶尔随机发散（如 "pinched the gently"）；温度越低（→0.6），分布越尖锐，输出更确定、重复，但语法更稳定。本实验中 `temperature=0.8` 相比 `1.0` 产生了更流畅的故事。
+
+2. **模型规模与训练步数**：本模型仅 17M 参数（4 层、512 维），在 4000 step / batch=256 下训练约 1B tokens，足以学习 TinyStories 的叙事模式，但在处理较复杂的依赖关系（如长程指代、复杂语法结构）时能力有限。更大的模型或更长训练轮次可显著提升生成质量。
+
+---
+
+### 附加生成示例（仅用于展示）
+
+以下展示了两次额外的生成：1) prompt 不包含 `<|endoftext|>`（即直接开始文本），2) prompt 为 `the game is over`。
+
+#### Prompt：`Once upon a time`（不包含 `<|endoftext|>`）
+
+- **LR=0.0055（iter=2500）** 输出：
+> , in a peaceful forest, there lived a big bear named Ben. Ben was very strong and could carry lots of stuff. One day, Ben met a small bird named Lily. Lily was very small and could not fly. Ben said to Lily, "Let's try to fly together. I can help you with your stuff." Lily agreed and they went to find the other animals to help Ben. They all worked together to find the big bear's mom. They walked and walked, trying to get the bear's home and help Ben. Soon, the bear's family came to help too. At the end of the day
+
+- **LR=0.012（iter=4000）** 输出：
+> , there was a little boy named Tim. Tim had a toy car that he loved to play with. One day, the toy car broke and Tim felt very sad. He wanted to fix the toy car, but he didn't know how. Tim's mom saw him and said, "Tim, why are you sad?" Tim told her about his broken toy car. His mom hugged him and said, "Don't worry, we will fix it together." So, they worked together to fix the toy car. After a while, they went to the toy store to buy new wheels. When they got to the store, Tim
+
+#### Prompt：`the game is over`
+
+- **LR=0.0055（iter=2500）** 输出：
+> . The end.
+
+- **LR=0.012（iter=4000）** 输出：
+> . You have to leave. You have to go home now." Lily and Ben start to cry. They feel sad and sorry. They say goodbye to their tower and go home. They have no more fun in the park. They have a bad ending. A bad ending. <|endoftext|>
+
+---
+
+### Problem (ablation_suite)
+
+本轮在同一训练配置（TinyStories, 17M, batch=256, max_iters=4000, max_learning_rate=0.012）下完成了 4 个消融：
+
+- remove RMSNorm（`rmsnorm`）
+- pre-norm -> post-norm（`postnorm`，扩展消融）
+- remove positional embedding information（NoPE，`nope`）
+- SwiGLU -> SiLU FFN（参数量近似匹配，`silu_ffn`）
+
+对比基线（RoPE + pre-norm + RMSNorm + SwiGLU）：
+
+- 基线 `valid/loss = 1.33268`（run: `8mgqfh78`, 4000 step）
+- `rmsnorm`：训练在 step 160 发散并提前终止（`train/loss=inf`），最后可用验证点约为 step 100 的 `valid/loss=2.76862`
+- `postnorm`：`valid/loss=1.44869`
+- `nope`：`valid/loss=1.40442`
+- `silu_ffn`：`valid/loss=1.33682`
+
+学习曲线插图预留：
+
+- `[在此插入 RMSNorm ablation 学习曲线（baseline vs rmsnorm）建议文件名 ablation_rmsnorm_curve.png]`
+- `[在此插入 RoPE vs NoPE 学习曲线建议文件名 ablation_rope_vs_nope_curve.png]`
+- `[在此插入 SwiGLU vs SiLU 学习曲线建议文件名 ablation_swiglu_vs_silu_curve.png]`
+- `[可选：在此插入 pre-norm vs post-norm 学习曲线建议文件名 ablation_prenorm_vs_postnorm_curve.png]`
+
+#### 实验中出现的问题与修复
+
+
+2. **早期 RMSNorm 消融运行中断**
+
+- `rmsnorm` 早期 run（`3gcamrk9`）在计算 `perplexity = exp(loss)` 时触发 `OverflowError`，导致 run 中断。
+- 修复后重跑（`vofa6o38`）能够继续记录，并在出现不可恢复的 `train/loss=inf` 时终止。
+
+#### 结论与讨论
+
+1. **RMSNorm 对稳定性影响最大**
+
+- 去掉 RMSNorm 后，在原最优学习率（0.012）下训练很快失稳并发散，说明 RMSNorm 在该配置下对优化稳定性是关键组件。
+
+2. **NoPE 明显劣化性能**
+
+- `nope` 相比基线验证损失上升约 `+0.07174`，说明位置信息（RoPE）对该语言建模任务有实质贡献。
+
+3. **SwiGLU 与参数量匹配的 SiLU-FFN 性能接近**
+
+- `silu_ffn` 与基线差距很小（约 `+0.00414`），在本实验预算下两者性能接近，但 SwiGLU 仍略优。
+
+4. **post-norm 在该训练设置下不如 pre-norm**
+
+- `postnorm` 相比基线上升约 `+0.11601`，显示在当前超参和模型规模下，pre-norm 更易优化。

@@ -1,0 +1,95 @@
+entity: halongbay-ge
+project: cs336-assignment1
+method: grid
+metric:
+  name: valid/loss
+  goal: minimize
+parameters:
+  train_tokens_path:
+    value: data/tinystories/train_tokens.npy
+  valid_tokens_path:
+    value: data/tinystories/valid_tokens.npy
+  vocab_size:
+    value: 10000
+  context_length:
+    value: 256
+  d_model:
+    value: 512
+  num_layers:
+    value: 4
+  num_heads:
+    value: 16
+  d_ff:
+    value: 1344
+  rope_theta:
+    value: 10000
+  dtype:
+    value: float32
+  batch_size:
+    value: 256
+  max_iters:
+    value: 4000
+  max_learning_rate:
+    values:
+      - 0.005
+      - 0.0055
+      - 0.006
+      - 0.0065
+  min_learning_rate:
+    value: 0.00003
+  warmup_iters:
+    value: 400
+  cosine_cycle_iters:
+    value: 4000
+  beta1:
+    value: 0.9
+  beta2:
+    value: 0.95
+  eps:
+    value: 1.0e-8
+  weight_decay:
+    value: 0.1
+  grad_clip_norm:
+    value: 1.0
+  eval_interval:
+    value: 100
+  eval_batches:
+    value: 20
+  log_interval:
+    value: 10
+  target_valid_loss:
+    value: 1.45
+  checkpoint_dir:
+    value: checkpoints/tinystories_lr_sweep_round5_refine_0050_0065
+  checkpoint_interval:
+    value: 1000
+  resume_from:
+    value: null
+  device:
+    value: cuda
+  seed:
+    value: 42
+  use_wandb:
+    value: true
+  wandb_project:
+    value: cs336-assignment1
+  wandb_group:
+    value: learning-rate-sweep-round5-refine-0050-0065
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - -m
+  - cs336_basics.train
+  - --train-tokens-path
+  - data/tinystories/train_tokens.npy
+  - --valid-tokens-path
+  - data/tinystories/valid_tokens.npy
+  - --vocab-size
+  - "10000"
+  - --use-wandb
+  - --wandb-project
+  - cs336-assignment1
+  - --wandb-group
+  - learning-rate-sweep-round5-refine-0050-0065

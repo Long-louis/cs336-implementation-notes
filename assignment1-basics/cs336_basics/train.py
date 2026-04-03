@@ -62,6 +62,13 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--wandb-entity", type=str, default=None)
 	parser.add_argument("--wandb-run-name", type=str, default=None)
 	parser.add_argument("--wandb-group", type=str, default=None)
+	parser.add_argument("--wandb-append-key-params", action="store_true")
+	parser.add_argument("--auto-stop-on-divergence", action="store_true")
+	parser.add_argument("--divergence-train-loss-threshold", type=float, default=20.0)
+	parser.add_argument("--divergence-val-loss-threshold", type=float, default=20.0)
+	parser.add_argument("--divergence-val-loss-increase-ratio", type=float, default=1.08)
+	parser.add_argument("--divergence-patience-evals", type=int, default=2)
+	parser.add_argument("--divergence-min-evals-before-stop", type=int, default=3)
 
 	return parser.parse_args()
 
@@ -124,7 +131,65 @@ def evaluate_loss(
 	return sum(losses) / len(losses)
 
 
+def apply_wandb_sweep_overrides(args: argparse.Namespace) -> argparse.Namespace:
+	if not args.use_wandb:
+		return args
+
+	if wandb.run is None:
+		return args
+
+	config = wandb.config
+	config_keys = set(config.keys())
+	path_fields = {"train_tokens_path", "valid_tokens_path", "checkpoint_dir", "resume_from"}
+
+	for key, value in vars(args).items():
+		if key not in config_keys:
+			continue
+
+		config_value = config[key]
+		if key in path_fields:
+			if config_value is None:
+				setattr(args, key, None)
+			else:
+				setattr(args, key, Path(config_value))
+			continue
+
+		setattr(args, key, config_value)
+
+	return args
+
+
 def run_training(args: argparse.Namespace) -> None:
+	if args.use_wandb:
+		wandb.init(
+			project=args.wandb_project,
+			entity=args.wandb_entity,
+			name=args.wandb_run_name,
+			group=args.wandb_group,
+			config=vars(args),
+		)
+		args = apply_wandb_sweep_overrides(args)
+		# 指标说明：
+		# - train/grad_step: 优化器实际完成的梯度更新步数，也是大多数曲线的横轴。
+		# - time/wallclock_seconds: 从训练开始到当前记录点的累计真实耗时（秒）。
+		wandb.define_metric("train/grad_step")
+		wandb.define_metric("time/wallclock_seconds")
+		# - train/loss: 当前训练 batch 的 token 平均交叉熵损失，越低越好，但噪声较大。
+		# - valid/loss: 验证集上按若干 batch 平均后的 token 平均交叉熵损失，是更关键的泛化指标。
+		# - train/perplexity: 训练损失对应的困惑度，等于 exp(train/loss)，越低越好。
+		# - valid/perplexity: 验证损失对应的困惑度，等于 exp(valid/loss)，越低越好。
+		wandb.define_metric("train/loss", step_metric="train/grad_step")
+		wandb.define_metric("valid/loss", step_metric="train/grad_step")
+		wandb.define_metric("train/perplexity", step_metric="train/grad_step")
+		wandb.define_metric("valid/perplexity", step_metric="train/grad_step")
+		run = wandb.run
+		if run is None:
+			raise ValueError("W&B run 初始化失败")
+		if args.wandb_append_key_params:
+			run.name = f"{run.name}-bs{args.batch_size}-lr{args.max_learning_rate:g}"
+		args.wandb_run_name = run.name
+		args.checkpoint_dir = args.checkpoint_dir / run.id
+
 	device = resolve_device(args.device)
 	dtype = resolve_dtype(args.dtype)
 
@@ -161,21 +226,6 @@ def run_training(args: argparse.Namespace) -> None:
 		weight_decay=args.weight_decay,
 	)
 
-	if args.use_wandb:
-		wandb.init(
-			project=args.wandb_project,
-			entity=args.wandb_entity,
-			name=args.wandb_run_name,
-			group=args.wandb_group,
-			config=vars(args),
-		)
-		wandb.define_metric("train/grad_step")
-		wandb.define_metric("time/wallclock_seconds")
-		wandb.define_metric("train/loss", step_metric="train/grad_step")
-		wandb.define_metric("valid/loss", step_metric="train/grad_step")
-		wandb.define_metric("train/perplexity", step_metric="train/grad_step")
-		wandb.define_metric("valid/perplexity", step_metric="train/grad_step")
-
 	args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
 	start_iter = 0
@@ -185,6 +235,11 @@ def run_training(args: argparse.Namespace) -> None:
 	model.train()
 	tokens_per_step = args.batch_size * args.context_length
 	run_start_time = time.perf_counter()
+	best_val_loss = float("inf")
+	bad_eval_streak = 0
+	eval_count = 0
+	stop_now = False
+	stop_reason = ""
 
 	for it in range(start_iter, args.max_iters):
 		step_start_time = time.perf_counter()
@@ -217,7 +272,13 @@ def run_training(args: argparse.Namespace) -> None:
 		step_time = time.perf_counter() - step_start_time
 		elapsed_seconds = time.perf_counter() - run_start_time
 		train_loss_value = float(loss.detach().cpu())
-		train_perplexity = math.exp(train_loss_value)
+		if not math.isfinite(train_loss_value):
+			stop_now = True
+			stop_reason = f"train/loss 为 {train_loss_value}，参数已不可恢复，提前终止"
+		try:
+			train_perplexity = math.exp(train_loss_value)
+		except OverflowError:
+			train_perplexity = float('inf')
 		tokens_per_second = tokens_per_step / step_time
 		current_iter = it + 1
 		tokens_seen = current_iter * tokens_per_step
@@ -236,8 +297,43 @@ def run_training(args: argparse.Namespace) -> None:
 				eval_batches=args.eval_batches,
 				device=device,
 			)
+			eval_count += 1
+
+			if args.auto_stop_on_divergence:
+				if not math.isfinite(val_loss_value):
+					stop_now = True
+					stop_reason = "valid/loss 非有限值（NaN 或 Inf）"
+				elif val_loss_value >= args.divergence_val_loss_threshold:
+					stop_now = True
+					stop_reason = (
+						f"valid/loss={val_loss_value:.6f} 超过阈值 "
+						f"{args.divergence_val_loss_threshold:.6f}"
+					)
+				else:
+					if val_loss_value < best_val_loss:
+						best_val_loss = val_loss_value
+						bad_eval_streak = 0
+					else:
+						if eval_count >= args.divergence_min_evals_before_stop and best_val_loss < float("inf"):
+							if val_loss_value >= best_val_loss * args.divergence_val_loss_increase_ratio:
+								bad_eval_streak += 1
+							else:
+								bad_eval_streak = 0
+					if bad_eval_streak >= args.divergence_patience_evals:
+						stop_now = True
+						stop_reason = (
+							f"valid/loss 连续 {bad_eval_streak} 次明显劣化，"
+							f"当前={val_loss_value:.6f}, best={best_val_loss:.6f}, "
+							f"ratio阈值={args.divergence_val_loss_increase_ratio:.3f}"
+						)
 
 		if should_log:
+			# 记录到控制台和 W&B 的指标说明：
+			# - train/lr: 当前 step 实际使用的学习率，可用来对照 warmup 和 cosine 衰减是否符合预期。
+			# - train/step_time_seconds: 单个训练 step 的耗时，可用于观察吞吐是否稳定。
+			# - train/tokens_seen: 从训练开始累计处理过的 token 数，便于跨 batch size 对齐训练进度。
+			# - train/tokens_per_second: 当前 step 的吞吐率，越高说明 GPU/数据管线利用越充分。
+			# - time/wallclock_seconds: 当前 run 从开始到现在的累计真实时间。
 			metrics: dict[str, float | int] = {
 				"train/grad_step": current_iter,
 				"train/loss": train_loss_value,
@@ -250,7 +346,10 @@ def run_training(args: argparse.Namespace) -> None:
 			}
 			if val_loss_value is not None:
 				metrics["valid/loss"] = val_loss_value
-				metrics["valid/perplexity"] = math.exp(val_loss_value)
+				try:
+					metrics["valid/perplexity"] = math.exp(val_loss_value)
+				except OverflowError:
+					metrics["valid/perplexity"] = float('inf')
 
 			print(metrics)
 
@@ -262,6 +361,12 @@ def run_training(args: argparse.Namespace) -> None:
 			latest_path = args.checkpoint_dir / "latest.pt"
 			save_checkpoint(model=model, optimizer=optimizer, iteration=current_iter, out=ckpt_path)
 			save_checkpoint(model=model, optimizer=optimizer, iteration=current_iter, out=latest_path)
+
+		if stop_now:
+			print({"train/grad_step": current_iter, "stop/reason": stop_reason})
+			if args.use_wandb:
+				wandb.log({"train/grad_step": current_iter, "stop/reason": stop_reason}, step=current_iter)
+			break
 
 	final_path = args.checkpoint_dir / "final.pt"
 	save_checkpoint(model=model, optimizer=optimizer, iteration=args.max_iters, out=final_path)
